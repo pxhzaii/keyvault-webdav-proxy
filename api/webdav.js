@@ -226,18 +226,14 @@ async function handleInit(request, env) {
   }
   
   const existing = await env.KEYVAULT_KV.get('auth:token_hash');
-  // 如果已有 tokenHash 且一致，无需更新
+  // 允许覆盖：确定性盐方案下，同密码的 tokenHash 一定相同
+  // 迁移场景下旧 tokenHash 需要被新 tokenHash 替换
+  await env.KEYVAULT_KV.put('auth:token_hash', body.tokenHash);
+  
   if (existing && existing === body.tokenHash) {
     return corsResponse(JSON.stringify({ ok: true, status: 'unchanged' }));
   }
-  // 如果已有 tokenHash 且不一致，说明是不同主密码，拒绝覆盖
-  // 避免后登录的浏览器覆盖先登录的 tokenHash 导致先登录的无法鉴权
-  if (existing && existing !== body.tokenHash) {
-    return corsResponse(JSON.stringify({ ok: false, error: 'TokenHash mismatch. Another vault already exists with a different master password.' }), 409);
-  }
-  // 首次注册
-  await env.KEYVAULT_KV.put('auth:token_hash', body.tokenHash);
-  return corsResponse(JSON.stringify({ ok: true, status: 'created' }));
+  return corsResponse(JSON.stringify({ ok: true, status: existing ? 'updated' : 'created' }));
 }
 
 // ===== 路由分发 =====
