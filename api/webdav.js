@@ -81,7 +81,7 @@ export default async function handler(req, res) {
     return res.status(403).json({ error: 'Target domain not allowed' });
   }
 
-  // 转发头
+  // 转发头（不发 Accept-Encoding，避免上游返回压缩数据导致浏览器二次解压乱码）
   const headers = {};
   for (const k of ['authorization', 'content-type', 'depth']) {
     if (req.headers[k]) headers[k] = req.headers[k];
@@ -100,6 +100,10 @@ export default async function handler(req, res) {
       const v = resp.headers.get(k);
       if (v) res.setHeader(k, v);
     }
+    // 禁止 CDN 对代理响应做 gzip/br 压缩，确保前端拿到原始 base64 文本
+    res.setHeader('Content-Encoding', 'identity');
+    res.setHeader('Cache-Control', 'no-transform');
+    res.setHeader('Vary', 'Accept-Encoding');
     
     res.status(resp.status);
     return res.send(Buffer.from(body));
