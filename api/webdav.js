@@ -44,20 +44,15 @@ function checkRateLimit(ip) {
   return true;
 }
 
-function setCorsHeaders(res, req) {
-  const origin = req.headers['origin'] || '';
-  // 只给 z.5as.cn 返回 CORS 头，其他网站浏览器会自动拦截跨域请求
-  const allowed = ALLOWED_ORIGINS.includes(origin) ? origin : '';
-  if (allowed) {
-    res.setHeader('Access-Control-Allow-Origin', allowed);
-  }
+function setCorsHeaders(res) {
+  res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type, Depth');
   res.setHeader('Access-Control-Max-Age', '86400');
 }
 
 export default async function handler(req, res) {
-  setCorsHeaders(res, req);
+  setCorsHeaders(res);
   
   if (req.method === 'OPTIONS') {
     return res.status(204).end();
