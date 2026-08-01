@@ -2,16 +2,14 @@
  * Vercel Serverless Function — WebDAV 代理
  * 
  * 用途：绕过 Cloudflare-to-Cloudflare 520 问题
- * 安全限制：来源校验 + 目标白名单 + 速率限制
+ * 安全限制：目标白名单 + 速率限制
+ * 
+ * 响应格式：对 GET/HEAD 请求返回 JSON { status, headers, bodyB64 }
+ * 其中 bodyB64 是响应体的 base64 编码，避免 CDN/代理层压缩导致前端解码错误
+ * 对 PUT/POST 等写入请求直接透传原始响应
  */
 
-// ===== 允许的来源站点 =====
-const ALLOWED_ORIGINS = [
-  'https://z.5as.cn',
-  'http://localhost:8788',
-];
-
-// ===== 允许代理的 WebDAV 目标域名 =====
+// ===== 允许的 WebDAV 目标域名 =====
 const ALLOWED_DOMAINS = [
   'dav.jianguoyun.com',
   'webdav.pcloud.com',
@@ -44,32 +42,41 @@ function checkRateLimit(ip) {
   return true;
 }
 
-function setCorsHeaders(res) {
+export default async function handler(req, res) {
+  // CORS
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type, Depth');
   res.setHeader('Access-Control-Max-Age', '86400');
-}
-
-export default async function handler(req, res) {
-  setCorsHeaders(res);
   
   if (req.method === 'OPTIONS') {
     return res.status(204).end();
   }
 
-  // 健康检查 — 直接 GET /api/webdav 无参数
-  if (!req.query.url) {
+  // 手动读取原始 body（bodyParser 已禁用）
+  let rawBody = null;
+  if (['POST', 'PUT', 'PATCH'].includes(req.method)) {
+    rawBody = await new Promise((resolve, reject) => {
+      const chunks = [];
+      req.on('data', chunk => chunks.push(chunk));
+      req.on('end', () => resolve(Buffer.concat(chunks)));
+      req.on('error', reject);
+    });
+  }
+
+  // 解析 query 参数
+  const url = new URL(req.url, `https://${req.headers.host}`);
+  const targetUrl = url.searchParams.get('url');
+  const method = (url.searchParams.get('method') || 'GET').toUpperCase();
+
+  // 健康检查
+  if (!targetUrl) {
     return res.status(200).json({ 
       ok: true, 
       service: 'keyvault-webdav-proxy',
       allowedDomains: ALLOWED_DOMAINS,
-      allowedOrigins: ALLOWED_ORIGINS,
     });
   }
-
-  const targetUrl = req.query.url;
-  const method = (req.query.method || 'GET').toUpperCase();
 
   // 速率限制
   const clientIp = (req.headers['x-forwarded-for'] || '').split(',')[0].trim() || 'unknown';
@@ -81,32 +88,42 @@ export default async function handler(req, res) {
     return res.status(403).json({ error: 'Target domain not allowed' });
   }
 
-  // 转发头（不发 Accept-Encoding，避免上游返回压缩数据导致浏览器二次解压乱码）
+  // 转发头
   const headers = {};
   for (const k of ['authorization', 'content-type', 'depth']) {
     if (req.headers[k]) headers[k] = req.headers[k];
   }
 
   const opts = { method, headers };
-  if (['POST', 'PUT', 'PATCH'].includes(method) && req.body) {
-    opts.body = typeof req.body === 'string' ? req.body : JSON.stringify(req.body);
+  if (rawBody && rawBody.length > 0) {
+    opts.body = rawBody;
   }
 
   try {
     const resp = await fetch(targetUrl, opts);
     const body = await resp.arrayBuffer();
     
+    // 收集安全头
+    const respHeaders = {};
     for (const k of ['content-type', 'dav', 'etag', 'last-modified']) {
       const v = resp.headers.get(k);
-      if (v) res.setHeader(k, v);
+      if (v) respHeaders[k] = v;
     }
-    // 禁止 CDN 对代理响应做 gzip/br 压缩，确保前端拿到原始 base64 文本
-    res.setHeader('Content-Encoding', 'identity');
-    res.setHeader('Cache-Control', 'no-transform');
-    res.setHeader('Vary', 'Accept-Encoding');
+
+    // 对读取类请求（GET/HEAD），用 JSON 包装响应，bodyB64 避免压缩/编码问题
+    if (['GET', 'HEAD'].includes(method)) {
+      return res.status(200).json({
+        status: resp.status,
+        headers: respHeaders,
+        bodyB64: Buffer.from(body).toString('base64'),
+      });
+    }
     
-    res.status(resp.status);
-    return res.send(Buffer.from(body));
+    // 对写入类请求（PUT/MKCOL 等），直接返回状态码
+    return res.status(resp.status).json({
+      status: resp.status,
+      headers: respHeaders,
+    });
   } catch (err) {
     return res.status(502).json({ error: 'Proxy error: ' + (err?.message || String(err)) });
   }
@@ -114,6 +131,7 @@ export default async function handler(req, res) {
 
 export const config = {
   api: {
-    bodyParser: { sizeLimit: '10mb' },
+    bodyParser: false,
+    sizeLimit: '10mb',
   },
 };
