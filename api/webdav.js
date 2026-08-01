@@ -4,9 +4,10 @@
  * 用途：绕过 Cloudflare-to-Cloudflare 520 问题
  * 安全限制：目标白名单 + 速率限制
  * 
- * 响应格式：对 GET/HEAD 请求返回 JSON { status, headers, bodyB64 }
- * 其中 bodyB64 是响应体的 base64 编码，避免 CDN/代理层压缩导致前端解码错误
- * 对 PUT/POST 等写入请求直接透传原始响应
+ * 响应格式：所有请求统一返回 HTTP 200 + JSON body
+ * GET/HEAD: { status, headers, bodyB64 }
+ * PUT/MKCOL 等: { status, headers }
+ * 始终返回 200 是因为非 2xx 或 204 的 JSON body 可能被 CDN 层破坏
  */
 
 // ===== 允许的 WebDAV 目标域名 =====
@@ -119,8 +120,9 @@ export default async function handler(req, res) {
       });
     }
     
-    // 对写入类请求（PUT/MKCOL 等），直接返回状态码
-    return res.status(resp.status).json({
+    // 对写入类请求（PUT/MKCOL 等），统一返回 HTTP 200 + JSON
+    // 避免非 2xx 或 204 等状态码的 JSON body 被 CDN 层破坏导致前端 res.json() 解析失败
+    return res.status(200).json({
       status: resp.status,
       headers: respHeaders,
     });
