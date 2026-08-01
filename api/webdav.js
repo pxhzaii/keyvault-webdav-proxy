@@ -7,15 +7,37 @@
  * 
  * 部署方式：推送到 GitHub，在 Vercel 导入即可
  * 调用方式：POST /api/webdav?url=<encodedUrl>&method=GET
+ * 
+ * 安全限制：
+ * 1. 只代理白名单里的 WebDAV 域名
+ * 2. 只允许 z.5as.cn 来源调用（Origin/Referer 校验）
+ * 3. 每IP速率限制（60次/分钟）
  */
 
-// 域名白名单
-const ALLOWED_DOMAINS = [
-  'dav.jianguoyun.com',
-  'webdav.pcloud.com',
-  'webdav.hidrive.strato.com',
-  'dav.infini-cloud.net',
+// ===== 允许的来源站点（只有这些站点的请求才会被代理）=====
+const ALLOWED_ORIGINS = [
+  'https://z.5as.cn',
+  'http://localhost:8788',   // 本地开发用，部署后可删
 ];
+
+// ===== 允许代理的 WebDAV 目标域名 =====
+const ALLOWED_DOMAINS = [
+  'dav.jianguoyun.com',       // 坚果云
+  'webdav.pcloud.com',        // pCloud
+  'webdav.hidrive.strato.com',// HiDrive
+  'dav.infini-cloud.net',     // InfiniCLOUD
+];
+
+// 速率限制（内存，Vercel Serverless 单次调用有效，冷启动重置）
+const RATE_LIMIT = { max: 60, window: 60 };
+const rateLimitMap = new Map();
+
+function checkOrigin(req) {
+  const origin = req.headers['origin'] || req.headers['referer'];
+  if (!origin) return true; // 非浏览器请求（如 curl）放行，仅校验浏览器
+  const originBase = origin.startsWith('http://localhost') ? 'http://localhost' : origin.split('/').slice(0, 3).join('/');
+  return ALLOWED_ORIGINS.some(allowed => originBase.startsWith(allowed));
+}
 
 function isAllowed(urlStr) {
   try {
@@ -26,14 +48,40 @@ function isAllowed(urlStr) {
   } catch { return false; }
 }
 
+function checkRateLimit(ip) {
+  const now = Math.floor(Date.now() / 1000);
+  const entry = rateLimitMap.get(ip);
+  if (!entry || now - entry.start > RATE_LIMIT.window) {
+    rateLimitMap.set(ip, { start: now, count: 1 });
+    return true;
+  }
+  entry.count++;
+  if (entry.count > RATE_LIMIT.max) return false;
+  return true;
+}
+
 export default async function handler(req, res) {
-  // CORS
-  res.setHeader('Access-Control-Allow-Origin', '*');
+  // CORS — 只允许指定来源
+  const origin = req.headers['origin'] || '';
+  const corsOrigin = ALLOWED_ORIGINS.includes(origin) ? origin : ALLOWED_ORIGINS[0];
+  res.setHeader('Access-Control-Allow-Origin', corsOrigin);
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type, Depth, X-Api-Token');
+  res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type, Depth');
+  res.setHeader('Vary', 'Origin');
   
   if (req.method === 'OPTIONS') {
     return res.status(204).end();
+  }
+
+  // 来源校验
+  if (!checkOrigin(req)) {
+    return res.status(403).json({ error: 'Origin not allowed. Only z.5as.cn can use this proxy.' });
+  }
+
+  // 速率限制
+  const clientIp = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.headers['x-real-ip'] || 'unknown';
+  if (!checkRateLimit(clientIp)) {
+    return res.status(429).json({ error: 'Rate limit exceeded' });
   }
 
   const { url: targetUrl, method: targetMethod } = req.query;
@@ -43,12 +91,12 @@ export default async function handler(req, res) {
   }
   
   if (!isAllowed(targetUrl)) {
-    return res.status(403).json({ error: 'Domain not allowed' });
+    return res.status(403).json({ error: 'Target domain not allowed' });
   }
   
   const method = (targetMethod || 'GET').toUpperCase();
   
-  // 转发头
+  // 只转发 WebDAV 需要的头
   const headers = {};
   const fwd = ['authorization', 'content-type', 'depth'];
   for (const k of fwd) {
