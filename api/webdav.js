@@ -88,11 +88,11 @@ export default async function handler(req, res) {
   // 速率限制
   const clientIp = (req.headers['x-forwarded-for'] || '').split(',')[0].trim() || 'unknown';
   if (!checkRateLimit(clientIp)) {
-    return res.status(200).json({ status: 429, error: 'Rate limit exceeded' });
+    return res.status(429).json({ error: 'Rate limit exceeded' });
   }
 
   if (!isAllowed(targetUrl)) {
-    return res.status(200).json({ status: 403, error: 'Target domain not allowed' });
+    return res.status(403).json({ error: 'Target domain not allowed' });
   }
 
   // 转发头
