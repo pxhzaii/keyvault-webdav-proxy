@@ -1,308 +1,145 @@
 /**
- * KeyVault 后端 — Cloudflare Pages Function
+ * Vercel Serverless Function — WebDAV 代理
  * 
- * 功能：
- * 1. /api/vault     — KV 加密存储（GET/PUT）
- * 2. /api/webdav-proxy — WebDAV CORS 代理（解决坚果云等跨域问题）
- * 3. /api/init      — 初始化 Token（首次设置主密码时调用）
+ * 用途：绕过 Cloudflare-to-Cloudflare 520 问题
+ * 安全限制：目标白名单 + 速率限制
  * 
- * 部署方式：放在 functions/api/[[route]].js
- * Cloudflare Pages 会自动将此文件映射为 /api/* 路由
+ * 响应格式：所有请求统一返回 HTTP 200 + JSON body
+ * GET/HEAD: { status, headers, bodyB64 }
+ * PUT/MKCOL 等: { status, headers }
+ * 始终返回 200 是因为非 2xx 或 204 的 JSON body 可能被 CDN 层破坏
  */
 
-const CORS = {
-  'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Methods': 'GET, PUT, DELETE, OPTIONS, PROPFIND, MKCOL, MOVE, COPY, HEAD, POST',
-  'Access-Control-Allow-Headers': 'Authorization, Content-Type, Depth, Destination, X-Api-Token',
-  'Access-Control-Expose-Headers': 'DAV, Content-Length, ETag',
-  'Access-Control-Max-Age': '86400',
-};
-
-function corsResponse(body, status = 200, extraHeaders = {}) {
-  return new Response(body, {
-    status,
-    headers: { ...CORS, 'Content-Type': 'application/json', ...extraHeaders },
-  });
-}
-
-// ===== Token 验证 =====
-// 客户端用主密码 PBKDF2 派生 API Token
-// 服务端存储 Token 的 SHA-256 哈希，验证时对比
-async function verifyToken(request, env) {
-  const auth = request.headers.get('Authorization');
-  if (!auth || !auth.startsWith('Bearer ')) return false;
-  const token = auth.slice(7);
-  const tokenHash = await sha256(token);
-  
-  // KV 中存储的 token hash
-  const stored = await env.KEYVAULT_KV.get('auth:token_hash');
-  if (!stored) {
-    // 首次初始化：必须通过 /api/init 端点显式注册
-    return false;
-  }
-  return stored === tokenHash;
-}
-
-async function sha256(str) {
-  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(str));
-  // 分块编码，避免大数组栈溢出
-  const arr = new Uint8Array(buf);
-  const chunks = [];
-  const chunkSize = 8192;
-  for (let i = 0; i < arr.length; i += chunkSize) {
-    chunks.push(String.fromCharCode(...arr.slice(i, i + chunkSize)));
-  }
-  return btoa(chunks.join(''));
-}
-
-// ===== Vault API =====
-async function handleVaultGet(request, env) {
-  if (!await verifyToken(request, env)) {
-    return corsResponse(JSON.stringify({ error: 'Unauthorized' }), 401);
-  }
-  const data = await env.KEYVAULT_KV.get('vault:main', 'json');
-  if (!data) {
-    return corsResponse(JSON.stringify({ error: 'No vault data' }), 404);
-  }
-  return corsResponse(JSON.stringify(data));
-}
-
-async function handleVaultPut(request, env) {
-  if (!await verifyToken(request, env)) {
-    return corsResponse(JSON.stringify({ error: 'Unauthorized' }), 401);
-  }
-  const body = await request.json();
-  
-  // 保存当前版本快照（最多保留 5 个）
-  const current = await env.KEYVAULT_KV.get('vault:main', 'json');
-  if (current && current.version) {
-    const snapshotKey = `vault:snapshot:${current.version}`;
-    await env.KEYVAULT_KV.put(snapshotKey, JSON.stringify(current));
-    // 清理旧快照
-    const list = await env.KEYVAULT_KV.list({ prefix: 'vault:snapshot:' });
-    if (list.keys.length > 5) {
-      const toDelete = list.keys
-        .sort((a, b) => a.name.localeCompare(b.name))
-        .slice(0, list.keys.length - 5);
-      for (const k of toDelete) {
-        await env.KEYVAULT_KV.delete(k.name);
-      }
-    }
-  }
-  
-  await env.KEYVAULT_KV.put('vault:main', JSON.stringify(body));
-  return corsResponse(JSON.stringify({ ok: true, version: body.version }));
-}
-
-// ===== WebDAV CORS 代理 =====
-
-// 允许代理的 WebDAV 域名白名单（防止被滥用扫描内网/公网）
-// 部署时请根据实际使用的 WebDAV 服务修改此列表
-const ALLOWED_WEBDAV_DOMAINS = [
-  'dav.jianguoyun.com',        // 坚果云
-  'webdav.pcloud.com',         // pCloud
-  'webdav.hidrive.strato.com', // HiDrive
-  'dav.infini-cloud.net',      // InfiniCLOUD
-  // 自建服务请在下方添加精确域名，如：
-  // 'nextcloud.example.com',
-  // 'alist.example.com',
+// ===== 允许的 WebDAV 目标域名 =====
+const ALLOWED_DOMAINS = [
+  'dav.jianguoyun.com',
+  'webdav.pcloud.com',
+  'webdav.hidrive.strato.com',
+  'dav.infini-cloud.net',
 ];
 
-// 速率限制：基于 KV 实现（Worker 无状态，内存 Map 不可靠）
+// 速率限制
 const RATE_LIMIT = { max: 60, window: 60 };
+const rateLimitMap = new Map();
 
-async function checkRateLimit(ip, env) {
-  const key = `ratelimit:${ip}`;
-  const now = Math.floor(Date.now() / 1000);
-  const stored = await env.KEYVAULT_KV.get(key, 'json');
-  if (!stored || now - stored.start > RATE_LIMIT.window) {
-    await env.KEYVAULT_KV.put(key, JSON.stringify({ start: now, count: 1 }), { expirationTtl: RATE_LIMIT.window + 10 });
-    return true;
-  }
-  stored.count++;
-  if (stored.count > RATE_LIMIT.max) return false;
-  await env.KEYVAULT_KV.put(key, JSON.stringify(stored), { expirationTtl: RATE_LIMIT.window + 10 });
-  return true;
-}
-
-function isDomainAllowed(urlStr) {
+function isAllowed(urlStr) {
   try {
-    const target = new URL(urlStr);
-    const hostname = target.hostname.toLowerCase();
-    // 只允许 HTTPS（防止明文传输凭据）
-    if (target.protocol !== 'https:') return false;
-    return ALLOWED_WEBDAV_DOMAINS.some(allowed => {
-      // 精确匹配或子域名匹配，避免 includes() 模糊匹配
-      return hostname === allowed || hostname.endsWith('.' + allowed);
-    });
+    const u = new URL(urlStr);
+    if (u.protocol !== 'https:') return false;
+    const h = u.hostname.toLowerCase();
+    return ALLOWED_DOMAINS.some(d => h === d || h.endsWith('.' + d));
   } catch { return false; }
 }
 
-async function handleWebdavProxy(request, env) {
-  // 速率限制
-  const clientIp = request.headers.get('cf-connecting-ip') || 
-                   request.headers.get('x-forwarded-for')?.split(',')[0] || 'unknown';
-  if (!await checkRateLimit(clientIp, env)) {
-    return corsResponse(JSON.stringify({ error: 'Rate limit exceeded. Max 60 requests/minute.' }), 429);
+function checkRateLimit(ip) {
+  const now = Math.floor(Date.now() / 1000);
+  const entry = rateLimitMap.get(ip);
+  if (!entry || now - entry.start > RATE_LIMIT.window) {
+    rateLimitMap.set(ip, { start: now, count: 1 });
+    return true;
   }
+  entry.count++;
+  if (entry.count > RATE_LIMIT.max) return false;
+  return true;
+}
+
+export default async function handler(req, res) {
+  // CORS
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type, Depth');
+  res.setHeader('Access-Control-Max-Age', '86400');
   
-  const url = new URL(request.url);
+  // CORS 预检 — bodyParser:false 模式下必须手动消费请求体再响应
+  if (req.method === 'OPTIONS') {
+    // 消费请求体（即使 OPTIONS 通常没有 body，Vercel runtime 要求消费完流）
+    await new Promise((resolve) => {
+      req.on('data', () => {});
+      req.on('end', resolve);
+    });
+    return res.status(204).end();
+  }
+
+  // 手动读取原始 body（bodyParser 已禁用）
+  let rawBody = null;
+  if (['POST', 'PUT', 'PATCH'].includes(req.method)) {
+    rawBody = await new Promise((resolve, reject) => {
+      const chunks = [];
+      req.on('data', chunk => chunks.push(chunk));
+      req.on('end', () => resolve(Buffer.concat(chunks)));
+      req.on('error', reject);
+    });
+  }
+
+  // 解析 query 参数
+  const url = new URL(req.url, `https://${req.headers.host}`);
   const targetUrl = url.searchParams.get('url');
-  const realMethod = url.searchParams.get('method') || 'GET';
-  
+  const method = (url.searchParams.get('method') || 'GET').toUpperCase();
+
+  // 健康检查
   if (!targetUrl) {
-    return corsResponse(JSON.stringify({ error: 'Missing url parameter' }), 400);
+    return res.status(200).json({ 
+      ok: true, 
+      service: 'keyvault-webdav-proxy',
+      allowedDomains: ALLOWED_DOMAINS,
+    });
   }
-  
-  // 域名白名单校验
-  if (!isDomainAllowed(targetUrl)) {
-    try {
-      const targetHost = new URL(targetUrl).hostname;
-      return corsResponse(
-        JSON.stringify({ 
-          error: `Domain "${targetHost}" is not in the allowed WebDAV whitelist.` 
-        }), 403
-      );
-    } catch {
-      return corsResponse(JSON.stringify({ error: 'Invalid target URL' }), 400);
-    }
+
+  // 速率限制
+  const clientIp = (req.headers['x-forwarded-for'] || '').split(',')[0].trim() || 'unknown';
+  if (!checkRateLimit(clientIp)) {
+    return res.status(429).json({ error: 'Rate limit exceeded' });
   }
-  
-  // 只转发 WebDAV 需要的头
-  const headers = new Headers();
-  // 伪装为正常浏览器请求，避免被坚果云 Cloudflare WAF 拦截返回 520
-  headers.set('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36');
-  headers.set('Accept', '*/*');
-  headers.set('Accept-Language', 'zh-CN,zh;q=0.9,en;q=0.8');
-  const forwardHeaders = ['authorization', 'content-type', 'depth', 'if-match', 'if-none-match', 'overwrite', 'destination'];
-  for (const key of forwardHeaders) {
-    const val = request.headers.get(key);
-    if (val) headers.set(key, val);
+
+  if (!isAllowed(targetUrl)) {
+    return res.status(403).json({ error: 'Target domain not allowed' });
   }
-  
-  const init = {
-    method: realMethod,
-    headers,
-    redirect: 'follow',
-  };
-  
-  // 只有带 body 的方法才转发 body
-  if (['POST', 'PUT', 'PATCH'].includes(realMethod)) {
-    try {
-      const bodyBuf = await request.arrayBuffer();
-      if (bodyBuf.byteLength > 0) init.body = bodyBuf;
-    } catch(e) { /* no body */ }
+
+  // 转发头
+  const headers = {};
+  for (const k of ['authorization', 'content-type', 'depth']) {
+    if (req.headers[k]) headers[k] = req.headers[k];
   }
-  
+
+  const opts = { method, headers };
+  if (rawBody && rawBody.length > 0) {
+    opts.body = rawBody;
+  }
+
   try {
-    const resp = await fetch(targetUrl, init);
+    const resp = await fetch(targetUrl, opts);
     const body = await resp.arrayBuffer();
-    const respHeaders = new Headers();
-    const safeHeaders = ['content-type', 'dav', 'etag', 'last-modified', 'content-length', 'content-range'];
-    for (const key of safeHeaders) {
-      const val = resp.headers.get(key);
-      if (val) respHeaders.set(key, val);
-    }
-    for (const [k, v] of Object.entries(CORS)) {
-      respHeaders.set(k, v);
-    }
-    respHeaders.set('Access-Control-Expose-Headers', 'DAV, Content-Length, Content-Range, ETag');
     
-    return new Response(body, {
+    // 收集安全头
+    const respHeaders = {};
+    for (const k of ['content-type', 'dav', 'etag', 'last-modified']) {
+      const v = resp.headers.get(k);
+      if (v) respHeaders[k] = v;
+    }
+
+    // 对读取类请求（GET/HEAD），用 JSON 包装响应，bodyB64 避免压缩/编码问题
+    if (['GET', 'HEAD'].includes(method)) {
+      return res.status(200).json({
+        status: resp.status,
+        headers: respHeaders,
+        bodyB64: Buffer.from(body).toString('base64'),
+      });
+    }
+    
+    // 对写入类请求（PUT/MKCOL 等），统一返回 HTTP 200 + JSON
+    // 避免非 2xx 或 204 等状态码的 JSON body 被 CDN 层破坏导致前端 res.json() 解析失败
+    return res.status(200).json({
       status: resp.status,
-      statusText: resp.statusText,
       headers: respHeaders,
     });
   } catch (err) {
-    return corsResponse(JSON.stringify({ error: 'Proxy error: ' + (err?.message || String(err)) }), 502);
+    return res.status(502).json({ error: 'Proxy error: ' + (err?.message || String(err)) });
   }
 }
 
-// ===== 初始化 =====
-async function handleInit(request, env) {
-  const body = await request.json();
-  if (!body.tokenHash) {
-    return corsResponse(JSON.stringify({ error: 'Missing tokenHash' }), 400);
-  }
-  
-  const existing = await env.KEYVAULT_KV.get('auth:token_hash');
-  // 允许覆盖：确定性盐方案下，同密码的 tokenHash 一定相同
-  // 迁移场景下旧 tokenHash 需要被新 tokenHash 替换
-  await env.KEYVAULT_KV.put('auth:token_hash', body.tokenHash);
-  
-  if (existing && existing === body.tokenHash) {
-    return corsResponse(JSON.stringify({ ok: true, status: 'unchanged' }));
-  }
-  return corsResponse(JSON.stringify({ ok: true, status: existing ? 'updated' : 'created' }));
-}
-
-// ===== 路由分发 =====
-export async function onRequest(context) {
-  const { request, env } = context;
-  const url = new URL(request.url);
-  
-  // CORS 预检
-  if (request.method === 'OPTIONS') {
-    return new Response(null, { status: 204, headers: CORS });
-  }
-  
-  try {
-    // 路由
-  if (url.pathname === '/api/vault') {
-    if (request.method === 'GET') return handleVaultGet(request, env);
-    if (request.method === 'PUT') return handleVaultPut(request, env);
-    if (request.method === 'DELETE') {
-      if (!await verifyToken(request, env)) return corsResponse(JSON.stringify({ error: 'Unauthorized' }), 401);
-      await env.KEYVAULT_KV.delete('vault:main');
-      return corsResponse(JSON.stringify({ ok: true }));
-    }
-  }
-  
-  if (url.pathname === '/api/webdav-proxy') {
-    return handleWebdavProxy(request, env);
-  }
-  
-  // 调试端点：验证 Worker 是否存活、fetch 坚果云是否可达
-  if (url.pathname === '/api/debug') {
-    try {
-      const testUrl = 'https://dav.jianguoyun.com/dav/';
-      const start = Date.now();
-      const resp = await fetch(testUrl, { 
-        method: 'GET', 
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-          'Accept': '*/*',
-          'Authorization': 'Basic dGVzdDp0ZXN0'
-        }
-      });
-      const elapsed = Date.now() - start;
-      const body = await resp.text();
-      return corsResponse(JSON.stringify({
-        ok: true,
-        target: testUrl,
-        status: resp.status,
-        elapsed: elapsed + 'ms',
-        bodyPreview: body.substring(0, 200),
-        respHeaders: Object.fromEntries(resp.headers.entries())
-      }));
-    } catch (err) {
-      return corsResponse(JSON.stringify({ ok: false, error: err?.message || String(err) }));
-    }
-  }
-  
-  if (url.pathname === '/api/init') {
-    // 初始化端点也加速率限制（防止暴力尝试）
-    const clientIp = request.headers.get('cf-connecting-ip') || 
-                     request.headers.get('x-forwarded-for')?.split(',')[0] || 'unknown';
-  if (!await checkRateLimit(clientIp, env)) {
-      return corsResponse(JSON.stringify({ error: 'Rate limit exceeded. Max 60 requests/minute.' }), 429);
-    }
-    return handleInit(request, env);
-  }
-  
-   return corsResponse(JSON.stringify({ error: 'Not found' }), 404);
-  } catch (err) {
-    // 全局异常兜底：任何未捕获的异常返回 502 而不是让 Cloudflare 返回 520
-    return corsResponse(JSON.stringify({ error: 'Internal error: ' + (err?.message || String(err)) }), 502);
-  }
-}
+export const config = {
+  api: {
+    bodyParser: false,
+    sizeLimit: '10mb',
+  },
+};
