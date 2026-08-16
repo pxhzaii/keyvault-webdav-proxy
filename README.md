@@ -7,8 +7,8 @@
 
 2. 登录 [Vercel](https://vercel.com/) → **Add New** → **Project** → 导入该仓库
 3. 直接点击 **Deploy**
-4. 记录域名，如 `https://keyvault-webdav-proxy.vercel.app`
-5. 代理地址就是`https://keyvault-webdav-proxy.vercel.app/api/webdav`
+4. 记录域名，如 `https://aaa.vercel.app`
+5. 代理地址就是 `https://aaa.vercel.app/api/webdav`
 
 api/webdav.js有白名单，可自行修改
 
