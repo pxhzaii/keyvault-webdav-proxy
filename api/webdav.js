@@ -12,7 +12,7 @@
 
 // ===== 允许的 WebDAV 目标域名 =====
 const ALLOWED_DOMAINS = [
-  'dav.jianguoyun.com',
+  
   'webdav.pcloud.com',
   'webdav.hidrive.strato.com',
   'dav.infini-cloud.net',
