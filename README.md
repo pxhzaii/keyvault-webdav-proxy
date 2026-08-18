@@ -1,6 +1,6 @@
 
 # webdav代理
-解决了  [keyvault](https://github.com/pxhzaii/keyvault)和[NavSync](https://github.com/pxhzaii/NavSync)   无法使用坚果云备份的问题
+解决了  [keyvault](https://github.com/pxhzaii/keyvault)和[NavSync](https://github.com/pxhzaii/NavSync) 或者其他cloudflare项目  无法使用坚果云备份的问题
 
 ## 部署
 1. Fork [代理仓库](https://github.com/pxhzaii/keyvault-webdav-proxy)
